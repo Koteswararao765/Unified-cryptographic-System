@@ -1,0 +1,627 @@
+`timescale 1ns / 1ps
+//======================================================================
+// tb_unified_crypto.v      (replaces your old testbench of the same name)
+//
+// Simulation of the ECIES version of unified_crypto_top:
+//
+//   PUBKEY   : Q = d*G                                  (receiver publishes Q)
+//   ENCRYPT  : sender knows only Q and a fresh r
+//              R = r*G, S = r*Q, KDF(S.x) -> K_enc||K_mac,
+//              CT = AES(K_enc, PT), TAG = HMAC-SHA256(K_mac, CT)
+//              transmit  R || CT || TAG
+//   DECRYPT  : receiver knows only d
+//              validate R, S = d*R, KDF(S.x), verify TAG, then AES-decrypt
+//
+// Drives unified_crypto_top directly: no UART, no LEDs, no board wrapper.
+//
+// Small scalars (1..10) are used on purpose: the ladder cost grows with
+// the bit length of the scalar, so these run in seconds in xsim, while a
+// 256-bit scalar needs ~13M clock cycles per scalar multiplication.
+// (The full-length behaviour was verified separately in Verilator.)
+//
+// Internal probes (dut.shared_x, dut.kdf) are SIMULATION-ONLY hierarchical
+// references: the chip does not output the shared secret or the keys.
+// They are read the instant done/error pulses, before the controller
+// wipes them on its way back to idle.
+//
+// Test map
+//   1-4    PUBKEY  d = 1,2,3,5                     -> Q = d*G
+//   5-6    ENCRYPT vector sets A and B             -> R, S.x, KDF, CT, TAG
+//   7-8    DECRYPT vector sets A and B             -> S.x, KDF, tag_match, PT
+//   9-10   ROUND TRIP (no stored vectors)          -> receiver/sender agree on S and key
+//   11     DECRYPT, 1 tag bit flipped              -> ERROR_TAG, no plaintext released
+//   12     DECRYPT, 1 ciphertext bit flipped       -> ERROR_TAG
+//   13     DECRYPT, wrong private key              -> ERROR_TAG
+//   14     DECRYPT, R not on curve                 -> ERROR_PT
+//   15     DECRYPT, Rx >= p (out of range)         -> ERROR_PT
+//   16     ENCRYPT, invalid recipient key          -> ERROR_PT
+//   17     ENCRYPT, r = 0                          -> ERROR_ECC
+//   18     PUBKEY,  d = 0 (no key loaded)          -> ERROR_ECC
+//   19     DECRYPT, d = 0 (no key loaded)          -> ERROR_ECC
+//   20     mode / inputs scrambled mid-run         -> run unaffected (inputs are latched)
+//   21     ENCRYPT again after the error cases     -> controller recovered
+//   22     key material wiped when idle            -> kdf / S.x / scalar / AES key == 0
+//======================================================================
+
+module tb_unified_crypto;
+
+    //------------------------------------------------------------------
+    // DUT I/O
+    //------------------------------------------------------------------
+    reg          clk;
+    reg          reset_n;
+    reg          start;
+    reg  [1:0]   mode;            // 0 = DECRYPT, 1 = ENCRYPT, 2 = PUBKEY
+    reg  [255:0] scalar;          // ENCRYPT: ephemeral r.  DECRYPT/PUBKEY: private key d
+    reg  [255:0] pub_x;           // ENCRYPT: recipient Q.  DECRYPT: sender's R
+    reg  [255:0] pub_y;
+    reg  [127:0] data_in;         // ENCRYPT: plaintext.    DECRYPT: ciphertext
+    reg  [255:0] rx_tag;          // DECRYPT: received tag
+
+    wire [255:0] out_x;           // ENCRYPT: R.  PUBKEY: Q
+    wire [255:0] out_y;
+    wire [127:0] data_out;
+    wire [255:0] tag_out;
+    wire         tag_match;
+    wire         busy;
+    wire         done;
+    wire         error;
+    wire [1:0]   err_code;
+
+    localparam [1:0] M_DEC = 2'd0, M_ENC = 2'd1, M_PUB = 2'd2;
+    localparam [1:0] ERR_ECC = 2'd1, ERR_PT = 2'd2, ERR_TAG = 2'd3;
+
+    // Watchdog only matters if the DUT hangs; a passing run never waits for it.
+    localparam integer WATCHDOG_NS = 200_000_000;     // 200 ms
+
+    integer errors;
+    integer test_num;
+    reg     timed_out;
+    time    t_begin, t_elapsed;
+
+    //------------------------------------------------------------------
+    // DUT
+    //------------------------------------------------------------------
+    unified_crypto_top dut (
+        .clk       (clk),
+        .reset_n   (reset_n),
+        .start     (start),
+        .mode      (mode),
+        .scalar    (scalar),
+        .pub_x     (pub_x),
+        .pub_y     (pub_y),
+        .data_in   (data_in),
+        .rx_tag    (rx_tag),
+        .out_x     (out_x),
+        .out_y     (out_y),
+        .data_out  (data_out),
+        .tag_out   (tag_out),
+        .tag_match (tag_match),
+        .busy      (busy),
+        .done      (done),
+        .error     (error),
+        .err_code  (err_code)
+    );
+
+    //------------------------------------------------------------------
+    // 50 MHz clock = the real clock of nexys_a7_crypto_uart
+    //------------------------------------------------------------------
+    initial clk = 1'b0;
+    always #10 clk = ~clk;
+
+    //------------------------------------------------------------------
+    // Reference values (generated by an independent software model:
+    // pure-Python secp256k1 + hashlib/hmac + a standard AES library)
+    //------------------------------------------------------------------
+    // ---- multiples of G (public) ----
+    localparam [255:0] P1X = 256'h79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798;
+    localparam [255:0] P1Y = 256'h483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8;
+    localparam [255:0] P2X = 256'hc6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5;
+    localparam [255:0] P2Y = 256'h1ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a;
+    localparam [255:0] P3X = 256'hf9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9;
+    localparam [255:0] P3Y = 256'h388f7b0f632de8140fe337e62a37f3566500a99934c2231b6cb9fd7584b8e672;
+    localparam [255:0] P5X = 256'h2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4;
+    localparam [255:0] P5Y = 256'hd8ac222636e5e3d6d4dba9dda6c9c426f788271bab0d6840dca87d3aa6ac62d6;
+
+    // ---- vector set A: receiver d=3, sender ephemeral r=5 ----
+    //      Q = 3*G, R = 5*G, shared point S = 15*G
+    localparam [255:0] A_SX = 256'hd7924d4f7d43ea965a465ae3095ff41131e5946f3c85f79e44adbcf8e27e080e;
+    localparam [255:0] A_KDF = 256'h54ec6648928a0fe4486c3c1369014af320eebf765f1fbd527281306a82dd3eeb;
+    localparam [127:0] A_CT = 128'h017262b9a01421f942f841336049eadd;
+    localparam [255:0] A_TAG = 256'h22304235e1559f9810f40bb27fca9fdad4145b3a55165aee704f5175b3288d2a;
+    // ---- vector set B: receiver d=5, sender ephemeral r=2 ----
+    //      Q = 5*G, R = 2*G, shared point S = 10*G
+    localparam [255:0] B_SX = 256'ha0434d9e47f3c86235477c7b1ae6ae5d3442d49b1943c2b752a68e2a47e247c7;
+    localparam [255:0] B_KDF = 256'h238c14b735a05c42c563d4ad3c8feeb4f4f474a23de11a22105169b58e3ccdff;
+    localparam [127:0] B_CT = 128'h84063013ec550b8fbbe03f8790e60c3c;
+    localparam [255:0] B_TAG = 256'hef4603fa880d9163e44aeb3fca49d9d82bf1d102faa872f91d7695705d0e3f68;
+
+    // R_A with Ry+1 : NOT on the curve
+    localparam [255:0] A_RY_BAD = 256'hd8ac222636e5e3d6d4dba9dda6c9c426f788271bab0d6840dca87d3aa6ac62d7;
+    localparam [255:0] PRIME = 256'hfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f;
+    localparam [127:0] PT1 = 128'h00112233445566778899aabbccddeeff;
+    localparam [127:0] PT2 = 128'h0123456789ABCDEFFEDCBA9876543210;
+
+    //------------------------------------------------------------------
+    // Small helpers
+    //------------------------------------------------------------------
+    task banner;
+        input [14*8-1:0] kind;
+        input [64*8-1:0] name;
+        begin
+            test_num = test_num + 1;
+            $display("");
+            $display("############################################################");
+            $display("# TEST %0d [%0s]: %0s", test_num, kind, name);
+            $display("############################################################");
+        end
+    endtask
+
+    task chk256;
+        input [44*8-1:0] label;
+        input [255:0]    got;
+        input [255:0]    exp;
+        begin
+            $display("  %0s", label);
+            $display("    got      = %h", got);
+            $display("    expected = %h", exp);
+            if (got === exp) $display("    PASS");
+            else begin $display("    FAIL"); errors = errors + 1; end
+        end
+    endtask
+
+    task chk128;
+        input [44*8-1:0] label;
+        input [127:0]    got;
+        input [127:0]    exp;
+        begin
+            $display("  %0s", label);
+            $display("    got      = %h", got);
+            $display("    expected = %h", exp);
+            if (got === exp) $display("    PASS");
+            else begin $display("    FAIL"); errors = errors + 1; end
+        end
+    endtask
+
+    task chk1;
+        input [44*8-1:0] label;
+        input            got;
+        input            exp;
+        begin
+            if (got === exp) $display("  %0s = %b   PASS", label, got);
+            else begin
+                $display("  %0s = %b (expected %b)   FAIL", label, got, exp);
+                errors = errors + 1;
+            end
+        end
+    endtask
+
+    task chk2;
+        input [44*8-1:0] label;
+        input [1:0]      got;
+        input [1:0]      exp;
+        begin
+            if (got === exp) $display("  %0s = %0d   PASS", label, got);
+            else begin
+                $display("  %0s = %0d (expected %0d)   FAIL", label, got, exp);
+                errors = errors + 1;
+            end
+        end
+    endtask
+
+    task show_time;
+        begin
+            $display("  elapsed  = %0d clock cycles (%0d us at 50 MHz)", t_elapsed/20, t_elapsed/1000);
+        end
+    endtask
+
+    task fail_timeout;
+        begin
+            $display("RESULT: TIMEOUT - neither done nor error was asserted");
+            errors = errors + 1;
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // Drive one operation.  Stimulus changes on the falling edge, so the
+    // DUT sees clean, race-free values and a one-cycle start pulse.
+    //------------------------------------------------------------------
+    task pulse_start;
+        input [1:0]   t_mode;
+        input [255:0] t_scalar;
+        input [255:0] t_px;
+        input [255:0] t_py;
+        input [127:0] t_data;
+        input [255:0] t_tag;
+        begin
+            @(negedge clk);
+            mode = t_mode; scalar = t_scalar; pub_x = t_px; pub_y = t_py;
+            data_in = t_data; rx_tag = t_tag;
+            @(negedge clk);
+            start = 1'b1;
+            @(negedge clk);
+            start = 1'b0;
+            t_begin = $time;
+        end
+    endtask
+
+    task wait_done;
+        begin
+            timed_out = 1'b0;
+            fork : wait_blk
+                begin
+                    wait (done || error);
+                    disable wait_blk;
+                end
+                begin
+                    #(WATCHDOG_NS);
+                    timed_out = 1'b1;
+                    $display("*** WATCHDOG expired ***");
+                    disable wait_blk;
+                end
+            join
+            t_elapsed = $time - t_begin;
+        end
+    endtask
+
+    task launch;
+        input [1:0]   t_mode;
+        input [255:0] t_scalar;
+        input [255:0] t_px;
+        input [255:0] t_py;
+        input [127:0] t_data;
+        input [255:0] t_tag;
+        begin
+            pulse_start(t_mode, t_scalar, t_px, t_py, t_data, t_tag);
+            wait_done;
+        end
+    endtask
+
+    task settle;
+        begin
+            repeat (3) @(posedge clk);
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // PUBKEY : Q = d*G
+    //------------------------------------------------------------------
+    task run_pubkey_test;
+        input [64*8-1:0] test_name;
+        input [255:0]    t_d;
+        input [255:0]    t_exp_x;
+        input [255:0]    t_exp_y;
+        begin
+            banner("PUBKEY", test_name);
+            launch(M_PUB, t_d, 256'd0, 256'd0, 128'd0, 256'd0);
+            if (timed_out) fail_timeout;
+            else if (error) begin
+                $display("RESULT: unexpected ERROR, err_code = %0d", err_code);
+                errors = errors + 1;
+            end else begin
+                chk256("Qx = d*G", out_x, t_exp_x);
+                chk256("Qy = d*G", out_y, t_exp_y);
+                chk1  ("busy after done", busy, 1'b0);
+                show_time;
+            end
+            settle;
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // ENCRYPT (sender): needs only r and the recipient's PUBLIC key
+    //------------------------------------------------------------------
+    task run_encrypt_test;
+        input [64*8-1:0] test_name;
+        input [255:0]    t_r;
+        input [255:0]    t_qx;
+        input [255:0]    t_qy;
+        input [127:0]    t_pt;
+        input [255:0]    t_exp_rx;
+        input [255:0]    t_exp_ry;
+        input [255:0]    t_exp_sx;
+        input [255:0]    t_exp_kdf;
+        input [127:0]    t_exp_ct;
+        input [255:0]    t_exp_tag;
+        begin
+            banner("ENCRYPT", test_name);
+            launch(M_ENC, t_r, t_qx, t_qy, t_pt, 256'd0);
+            if (timed_out) fail_timeout;
+            else if (error) begin
+                $display("RESULT: unexpected ERROR, err_code = %0d", err_code);
+                errors = errors + 1;
+            end else begin
+                $display("ECC, ephemeral public key R = r*G (sent to receiver):");
+                chk256("Rx", out_x, t_exp_rx);
+                chk256("Ry", out_y, t_exp_ry);
+                $display("ECDH shared point S = r*Q (internal, never leaves the chip):");
+                chk256("S.x   [probe dut.shared_x]", dut.shared_x, t_exp_sx);
+                $display("KDF  SHA-256(S.x || 00000001):");
+                chk256("digest [probe dut.kdf]", dut.kdf, t_exp_kdf);
+                chk128("AES key = digest[255:128]", dut.kdf[255:128], t_exp_kdf[255:128]);
+                chk128("MAC key = digest[127:0]",   dut.kdf[127:0],   t_exp_kdf[127:0]);
+                $display("AES-128 ciphertext / HMAC-SHA256 tag:");
+                chk128("ciphertext", data_out, t_exp_ct);
+                chk256("tag",        tag_out,  t_exp_tag);
+                chk1  ("busy after done", busy, 1'b0);
+                show_time;
+            end
+            settle;
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // DECRYPT (receiver): needs only d and the received package
+    //------------------------------------------------------------------
+    task run_decrypt_test;
+        input [64*8-1:0] test_name;
+        input [255:0]    t_d;
+        input [255:0]    t_rx;
+        input [255:0]    t_ry;
+        input [127:0]    t_ct;
+        input [255:0]    t_tag;
+        input [255:0]    t_exp_sx;
+        input [255:0]    t_exp_kdf;
+        input [127:0]    t_exp_pt;
+        begin
+            banner("DECRYPT", test_name);
+            launch(M_DEC, t_d, t_rx, t_ry, t_ct, t_tag);
+            if (timed_out) fail_timeout;
+            else if (error || !done) begin
+                $display("RESULT: FAIL (expected done, got error=%b err_code=%0d)", error, err_code);
+                errors = errors + 1;
+            end else begin
+                $display("ECDH shared point S = d*R (must equal the sender's r*Q):");
+                chk256("S.x   [probe dut.shared_x]", dut.shared_x, t_exp_sx);
+                chk256("digest [probe dut.kdf]",     dut.kdf,      t_exp_kdf);
+                $display("Authentication + decryption:");
+                chk256("recomputed tag", tag_out, t_tag);
+                chk1  ("tag_match", tag_match, 1'b1);
+                chk128("plaintext", data_out, t_exp_pt);
+                chk1  ("busy after done", busy, 1'b0);
+                show_time;
+            end
+            settle;
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // ROUND TRIP with no stored vectors: receiver publishes Q, sender
+    // encrypts using only Q, receiver decrypts using only d.  Checks that
+    // both sides independently arrive at the same S and the same AES key.
+    //------------------------------------------------------------------
+    task run_roundtrip_test;
+        input [64*8-1:0] test_name;
+        input [255:0]    t_d;
+        input [255:0]    t_r;
+        input [127:0]    t_pt;
+        reg   [255:0]    qx, qy, rx, ry, tag, s_enc, s_dec;
+        reg   [127:0]    ct, key_enc, key_dec;
+        reg              ok;
+        begin
+            banner("ROUND TRIP", test_name);
+            ok = 1'b1;
+
+            launch(M_PUB, t_d, 256'd0, 256'd0, 128'd0, 256'd0);          // receiver
+            qx = out_x; qy = out_y;
+            if (timed_out || error) ok = 1'b0;
+            $display("  receiver  Q = d*G  : done=%b error=%b", done, error);
+            settle;
+
+            if (ok) begin
+                launch(M_ENC, t_r, qx, qy, t_pt, 256'd0);                // sender (knows only Q)
+                rx = out_x; ry = out_y; ct = data_out; tag = tag_out;
+                s_enc = dut.shared_x; key_enc = dut.kdf[255:128];
+                if (timed_out || error) ok = 1'b0;
+                $display("  sender    encrypt  : done=%b error=%b", done, error);
+                settle;
+            end
+
+            if (ok) begin
+                launch(M_DEC, t_d, rx, ry, ct, tag);                     // receiver (knows only d)
+                s_dec = dut.shared_x; key_dec = dut.kdf[255:128];
+                if (timed_out || error) ok = 1'b0;
+                $display("  receiver  decrypt  : done=%b error=%b", done, error);
+            end
+
+            if (!ok) begin
+                $display("RESULT: FAIL (an operation did not complete)");
+                errors = errors + 1;
+            end else begin
+                chk256("S.x  sender == receiver", s_enc, s_dec);
+                chk128("AES key  sender == receiver", key_enc, key_dec);
+                chk1  ("tag_match", tag_match, 1'b1);
+                chk128("recovered plaintext", data_out, t_pt);
+                if (ct === t_pt) begin
+                    $display("  FAIL: ciphertext equals plaintext");
+                    errors = errors + 1;
+                end else $display("  ciphertext differs from plaintext   PASS");
+                show_time;
+            end
+            settle;
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // Expected-ERROR cases.  Also checks that nothing is released:
+    // done stays low, tag_match stays 0, data_out is not overwritten.
+    //------------------------------------------------------------------
+    task run_error_test;
+        input [64*8-1:0] test_name;
+        input [1:0]      t_mode;
+        input [255:0]    t_scalar;
+        input [255:0]    t_px;
+        input [255:0]    t_py;
+        input [127:0]    t_data;
+        input [255:0]    t_tag;
+        input [1:0]      t_code;
+        reg   [127:0]    dout_before;
+        begin
+            banner("ERROR CASE", test_name);
+            dout_before = data_out;
+            launch(t_mode, t_scalar, t_px, t_py, t_data, t_tag);
+            if (timed_out) fail_timeout;
+            else begin
+                chk1  ("error asserted",   error, 1'b1);
+                chk1  ("done stayed low",  done,  1'b0);
+                chk2  ("err_code",         err_code, t_code);
+                chk1  ("tag_match",        tag_match, 1'b0);
+                chk1  ("busy after error", busy, 1'b0);
+                chk128("data_out untouched (nothing released)", data_out, dout_before);
+                show_time;
+            end
+            settle;
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // Latching test: scramble mode AND every data input while the run is
+    // in flight.  Only the values present at 'start' may matter.
+    //------------------------------------------------------------------
+    task run_glitch_test;
+        input [64*8-1:0] test_name;
+        input [255:0]    t_r;
+        input [255:0]    t_qx;
+        input [255:0]    t_qy;
+        input [127:0]    t_pt;
+        input [255:0]    t_exp_rx;
+        input [255:0]    t_exp_ry;
+        input [255:0]    t_exp_sx;
+        input [127:0]    t_exp_ct;
+        input [255:0]    t_exp_tag;
+        begin
+            banner("INPUT GLITCH", test_name);
+            pulse_start(M_ENC, t_r, t_qx, t_qy, t_pt, 256'd0);
+
+            repeat (50) @(posedge clk);
+            mode = M_DEC;  scalar = 256'd7;  pub_x = 256'd1; pub_y = 256'd2;
+            data_in = 128'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF; rx_tag = {256{1'b1}};
+            repeat (50) @(posedge clk);
+            mode = M_PUB;  scalar = 256'd0;  data_in = 128'd0;
+
+            wait_done;      // inputs are left scrambled until the run ends
+            if (timed_out) fail_timeout;
+            else if (error || !done) begin
+                $display("RESULT: FAIL (error=%b err_code=%0d)", error, err_code);
+                errors = errors + 1;
+            end else begin
+                chk256("Rx",   out_x,       t_exp_rx);
+                chk256("Ry",   out_y,       t_exp_ry);
+                chk256("S.x",  dut.shared_x, t_exp_sx);
+                chk128("ciphertext", data_out, t_exp_ct);
+                chk256("tag",  tag_out,     t_exp_tag);
+                $display("  PASS if all of the above passed: latched inputs protected the run");
+                show_time;
+            end
+            settle;
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // Key material must not linger while the core is idle
+    //------------------------------------------------------------------
+    task run_wipe_test;
+        begin
+            banner("WIPE CHECK", "key material cleared when idle");
+            repeat (5) @(posedge clk);
+            chk1  ("busy",            busy, 1'b0);
+            chk256("shared_x",        dut.shared_x,     256'd0);
+            chk256("kdf (AES+MAC)",   dut.kdf,          256'd0);
+            chk256("scalar latch k_l", dut.k_l,         256'd0);
+            chk256("aes_key_full",    dut.aes_key_full, 256'd0);
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // Main stimulus
+    //------------------------------------------------------------------
+    initial begin
+        errors   = 0;
+        test_num = 0;
+        timed_out = 1'b0;
+        start    = 1'b0;
+        mode     = M_ENC;
+        scalar   = 256'd0;
+        pub_x    = 256'd0;
+        pub_y    = 256'd0;
+        data_in  = 128'd0;
+        rx_tag   = 256'd0;
+
+        reset_n = 1'b0;
+        repeat (5) @(posedge clk);
+        reset_n = 1'b1;
+        repeat (5) @(posedge clk);
+
+        // ============ PUBKEY: Q = d*G ============
+        run_pubkey_test("d=1 -> Q = 1*G", 256'd1, P1X, P1Y);
+        run_pubkey_test("d=2 -> Q = 2*G", 256'd2, P2X, P2Y);
+        run_pubkey_test("d=3 -> Q = 3*G", 256'd3, P3X, P3Y);
+        run_pubkey_test("d=5 -> Q = 5*G", 256'd5, P5X, P5Y);
+
+        // ============ ENCRYPT (sender) ============
+        // Set A: receiver d=3 (Q=3G), sender r=5 (R=5G)
+        run_encrypt_test("set A: r=5, Q=3G", 256'd5, P3X, P3Y, PT1,
+                         P5X, P5Y, A_SX, A_KDF, A_CT, A_TAG);
+        // Set B: receiver d=5 (Q=5G), sender r=2 (R=2G)
+        run_encrypt_test("set B: r=2, Q=5G", 256'd2, P5X, P5Y, PT1,
+                         P2X, P2Y, B_SX, B_KDF, B_CT, B_TAG);
+
+        // ============ DECRYPT (receiver) ============
+        run_decrypt_test("set A: d=3, R=5G", 256'd3, P5X, P5Y, A_CT, A_TAG,
+                         A_SX, A_KDF, PT1);
+        run_decrypt_test("set B: d=5, R=2G", 256'd5, P2X, P2Y, B_CT, B_TAG,
+                         B_SX, B_KDF, PT1);
+
+        // ============ ROUND TRIPS (no stored vectors) ============
+        run_roundtrip_test("d=6, r=9",  256'd6,  256'd9, PT2);
+        run_roundtrip_test("d=10, r=3", 256'd10, 256'd3, PT1);
+
+        // ============ Attack / failure cases ============
+        // flip one tag bit
+        run_error_test("decrypt: one tag bit flipped",
+                       M_DEC, 256'd3, P5X, P5Y, A_CT, A_TAG ^ 256'h10, ERR_TAG);
+        // flip one ciphertext bit
+        run_error_test("decrypt: one ciphertext bit flipped",
+                       M_DEC, 256'd3, P5X, P5Y, A_CT ^ 128'h1, A_TAG, ERR_TAG);
+        // wrong private key (d=2 instead of 3): different S, different keys
+        run_error_test("decrypt: wrong private key",
+                       M_DEC, 256'd2, P5X, P5Y, A_CT, A_TAG, ERR_TAG);
+        // R not on the curve -> rejected before d*R is ever computed
+        run_error_test("decrypt: R not on curve (Ry+1)",
+                       M_DEC, 256'd3, P5X, A_RY_BAD, A_CT, A_TAG, ERR_PT);
+        // coordinate >= p
+        run_error_test("decrypt: Rx >= p (out of range)",
+                       M_DEC, 256'd3, PRIME, P5Y, A_CT, A_TAG, ERR_PT);
+        // sender given a garbage recipient key
+        run_error_test("encrypt: invalid recipient key (5,7)",
+                       M_ENC, 256'd5, 256'd5, 256'd7, PT1, 256'd0, ERR_PT);
+        // r = 0 -> R = point at infinity
+        run_error_test("encrypt: ephemeral r = 0",
+                       M_ENC, 256'd0, P3X, P3Y, PT1, 256'd0, ERR_ECC);
+        // no private key loaded (d = 0)
+        run_error_test("pubkey: d = 0",
+                       M_PUB, 256'd0, 256'd0, 256'd0, 128'd0, 256'd0, ERR_ECC);
+        run_error_test("decrypt: d = 0 (no key loaded)",
+                       M_DEC, 256'd0, P5X, P5Y, A_CT, A_TAG, ERR_ECC);
+
+        // ============ Robustness ============
+        run_glitch_test("inputs scrambled mid-run", 256'd5, P3X, P3Y, PT1,
+                        P5X, P5Y, A_SX, A_CT, A_TAG);
+
+        run_encrypt_test("set A again (post-error sanity check)", 256'd5, P3X, P3Y, PT1,
+                         P5X, P5Y, A_SX, A_KDF, A_CT, A_TAG);
+
+        run_wipe_test;
+
+        $display("");
+        $display("############################################################");
+        if (errors == 0)
+            $display("OVERALL RESULT = PASS  (%0d tests ran, 0 errors)", test_num);
+        else
+            $display("OVERALL RESULT = FAIL  (%0d error(s) across %0d tests)", errors, test_num);
+        $display("############################################################");
+
+        $finish;
+    end
+
+endmodule

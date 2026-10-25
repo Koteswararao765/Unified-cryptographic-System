@@ -1,0 +1,354 @@
+`timescale 1ns/1ps
+`default_nettype wire   // guard: an earlier file may leave default_nettype none
+//======================================================================
+// ecc_top_256_iter  -- secp256k1 scalar multiplier  R = k * (Px,Py)
+//
+// Ladder / normalisation logic is UNCHANGED from the verified design.
+// Added: point validation (chk_start / chk_done / chk_ok).
+//
+//   chk_start : 1-cycle pulse (only while idle). Checks that
+//               (Px,Py) satisfies  0<=Px,Py<p  and  y^2 = x^3 + 7 (mod p).
+//   chk_done  : 1-cycle pulse when the check has finished
+//   chk_ok    : valid while/after chk_done. 1 = point is on the curve.
+//
+// Why: a receiver must never run  d*R  on an attacker-supplied R that is
+// not on secp256k1 (invalid-curve attack). The check re-uses the engine's
+// existing multiplier through the ext_* port, so it costs almost no area.
+//======================================================================
+module ecc_top_256_iter #(
+    parameter WIDTH = 256,
+    parameter P = 256'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+)(
+    input  wire                clk,
+    input  wire                rst,
+    input  wire                start,
+    input  wire [WIDTH-1:0]    k,
+    input  wire [WIDTH-1:0]    Px,
+    input  wire [WIDTH-1:0]    Py,
+    output reg  [WIDTH-1:0]    Rx,
+    output reg  [WIDTH-1:0]    Ry,
+    output reg                 Rx_inf,
+    output reg                 done,
+
+    // point validation (see header)
+    input  wire                chk_start,
+    output reg                 chk_done,
+    output reg                 chk_ok
+);
+ 
+//--------------------------------------------------
+// Ladder point registers  R0 = (R0x,R0y,R0z,R0inf)
+//                         R1 = (R1x,R1y,R1z,R1inf)
+//--------------------------------------------------
+reg [WIDTH-1:0] R0x, R0y, R0z;
+reg [WIDTH-1:0] R1x, R1y, R1z;
+reg R0inf, R1inf;
+ 
+reg [7:0] bit_idx, msb_idx;
+reg [5:0] state;
+ 
+// Saved doubles of R0 and R1 for this ladder round
+reg [WIDTH-1:0] Xd0_r, Yd0_r, Zd0_r; reg Xd0_inf_r;
+reg [WIDTH-1:0] Xd1_r, Yd1_r, Zd1_r; reg Xd1_inf_r;
+ 
+//--------------------------------------------------
+// Shared point-arithmetic engine (double + add)
+//--------------------------------------------------
+reg  [WIDTH-1:0] eng_ax, eng_ay, eng_az; reg eng_ainf;
+reg  [WIDTH-1:0] eng_bx, eng_by, eng_bz; reg eng_binf;
+reg              eng_op, eng_start;
+wire [WIDTH-1:0] eng_ox, eng_oy, eng_oz; wire eng_oinf;
+wire             eng_done, eng_busy;
+ 
+reg              ext_start;
+reg  [WIDTH-1:0] ext_a, ext_b;
+wire [WIDTH-1:0] ext_res;
+wire             ext_done;
+ 
+wire                    alu_req_start_w;
+wire [WIDTH-1:0]        alu_req_a_w, alu_req_b_w;
+wire                    alu_req_sub_w;
+wire [WIDTH-1:0]        alu_res_w;
+wire                    alu_done_w;
+ 
+ecc_point_engine_256 #(WIDTH,P) U_ENG (
+    .clk(clk), .rst(rst),
+    .start(eng_start), .op(eng_op),
+ 
+    .X1(eng_ax), .Y1(eng_ay), .Z1(eng_az), .X1_inf(eng_ainf),
+    .X2(eng_bx), .Y2(eng_by), .Z2(eng_bz), .X2_inf(eng_binf),
+ 
+    .X3(eng_ox), .Y3(eng_oy), .Z3(eng_oz), .X3_inf(eng_oinf),
+ 
+    .done(eng_done), .busy(eng_busy),
+ 
+    .ext_start(ext_start), .ext_a(ext_a), .ext_b(ext_b),
+    .ext_res(ext_res),     .ext_done(ext_done),
+ 
+    .alu_ext_start(alu_req_start_w),
+    .alu_ext_a(alu_req_a_w),
+    .alu_ext_b(alu_req_b_w),
+    .alu_ext_sub(alu_req_sub_w),
+    .alu_ext_res(alu_res_w),
+    .alu_ext_done(alu_done_w)
+);
+ 
+//--------------------------------------------------
+// Modular inverter (shares U_ENG's ALU - see alu_req_*/alu_res_w wiring)
+//--------------------------------------------------
+reg              inv_start;
+wire [WIDTH-1:0] Zinv;
+wire             inv_done, inv_busy;
+ 
+mod_inv_bin_256 #(WIDTH,P) U_INV (
+    .clk(clk), .rst(rst), .start(inv_start),
+    .a(R0z), .inv(Zinv), .done(inv_done), .busy(inv_busy),
+ 
+    .alu_req_start(alu_req_start_w),
+    .alu_req_a(alu_req_a_w),
+    .alu_req_b(alu_req_b_w),
+    .alu_req_sub(alu_req_sub_w),
+    .alu_res(alu_res_w),
+    .alu_done(alu_done_w)
+);
+ 
+reg [WIDTH-1:0] Zinv2, Zinv3;
+ 
+//--------------------------------------------------
+// FSM states
+//--------------------------------------------------
+localparam
+    S_IDLE        = 0,
+    S_MSB         = 1,
+    S_INIT_DBL_W  = 2,
+    S_LADD        = 3,
+    S_DBL_R0_W    = 4,
+    S_LOAD_R1_DBL = 5,
+    S_DBL_R1_W    = 6,
+    S_ADD_START   = 7,
+    S_LADD_W      = 8,
+    S_NORM0       = 9,
+    S_NORM1       = 10,
+    S_NORM1W      = 11,
+    S_NORM2       = 12,
+    S_NORM2W      = 13,
+    S_NORM3       = 14,
+    S_DONE        = 15,
+    S_CK1         = 16,   // wait y^2
+    S_CK2         = 17,   // wait x^2
+    S_CK3         = 18,   // wait x^3
+    S_CK4         = 19;   // compare
+
+// validation scratch
+reg [WIDTH-1:0] ck_y2, ck_x3;
+// y^2 == x^3 + 7 (mod p)  <=>  d = y^2 - x^3  is 7  or  7-p   (both operands are in [0,p)).
+// One subtraction + two constant compares: much shallower than add/reduce/compare,
+// so it meets timing comfortably at 50 MHz.
+wire [WIDTH:0]  ck_d    = {1'b0, ck_y2} - {1'b0, ck_x3};     // 257-bit, wraps mod 2^257
+wire            ck_good = (ck_d == 257'd7) || (ck_d == (257'd7 - {1'b0, P}));
+ 
+always @(posedge clk) begin
+    if (rst) begin
+ 
+        R0x<=0; R0y<=0; R0z<=0; R0inf<=1'b0;
+        R1x<=0; R1y<=0; R1z<=0; R1inf<=1'b0;
+ 
+        Xd0_r<=0; Yd0_r<=0; Zd0_r<=0; Xd0_inf_r<=0;
+        Xd1_r<=0; Yd1_r<=0; Zd1_r<=0; Xd1_inf_r<=0;
+ 
+        state<=S_IDLE; done<=1'b0; Rx<=0; Ry<=0; Rx_inf<=1'b0;
+        bit_idx<=0; msb_idx<=255;
+ 
+        eng_start<=1'b0; eng_op<=1'b0;
+        eng_ax<=0; eng_ay<=0; eng_az<=0; eng_ainf<=0;
+        eng_bx<=0; eng_by<=0; eng_bz<=0; eng_binf<=0;
+ 
+        inv_start<=1'b0;
+        ext_start<=1'b0; ext_a<=0; ext_b<=0;
+        Zinv2<=0; Zinv3<=0;
+        ck_y2<=0; ck_x3<=0; chk_done<=1'b0; chk_ok<=1'b0;
+ 
+    end else begin
+ 
+        done      <= 1'b0;
+        eng_start <= 1'b0;
+        inv_start <= 1'b0;
+        ext_start <= 1'b0;
+        chk_done  <= 1'b0;
+ 
+        case (state)
+ 
+        //----------------------------------------------------
+        S_IDLE: if (chk_start) begin
+            if (Px >= P || Py >= P) begin
+                chk_ok <= 1'b0; chk_done <= 1'b1;            // out of range
+            end else begin
+                ext_a <= Py; ext_b <= Py; ext_start <= 1'b1;  // y^2
+                state <= S_CK1;
+            end
+        end else if (start) begin
+            if (k == 0) begin
+                Rx<=0; Ry<=0; Rx_inf<=1'b1; state<=S_DONE;
+            end else begin
+                R0x<=0;  R0y<=1;  R0z<=0; R0inf<=1'b1;   // R0 = O
+                R1x<=Px; R1y<=Py; R1z<=1; R1inf<=1'b0;   // R1 = P
+                msb_idx<=255; state<=S_MSB;
+            end
+        end
+ 
+        //----------------------------------------------------
+        // Find the top set bit of k, initialize R0 = P and
+        // start doubling P -> 2P for R1
+        //----------------------------------------------------
+        S_MSB: begin
+            if (k[msb_idx]) begin
+                if (msb_idx == 0) begin
+                    // k == 1
+                    R0x<=Px; R0y<=Py; R0z<=256'd1; R0inf<=1'b0;
+                    state <= S_NORM0;
+                end else begin
+                    R0x<=Px; R0y<=Py; R0z<=256'd1; R0inf<=1'b0;
+ 
+                    eng_ax<=Px; eng_ay<=Py; eng_az<=256'd1; eng_ainf<=1'b0;
+                    eng_op<=1'b0; eng_start<=1'b1;
+                    state<=S_INIT_DBL_W;
+                end
+            end else begin
+                if (msb_idx == 0) begin
+                    state <= S_DONE; Rx_inf <= 1'b1;
+                end else begin
+                    msb_idx <= msb_idx - 1'b1;
+                end
+            end
+        end
+ 
+        S_INIT_DBL_W: if (eng_done) begin
+            R1x<=eng_ox; R1y<=eng_oy; R1z<=eng_oz; R1inf<=eng_oinf;
+            bit_idx <= msb_idx - 1'b1;
+            state <= S_LADD;
+        end
+ 
+        //----------------------------------------------------
+        // Montgomery ladder round: double R0 -> save, double R1 ->
+        // save, add R0+R1 -> select which becomes R0/R1 for next bit
+        //----------------------------------------------------
+        S_LADD: begin
+            eng_ax<=R0x; eng_ay<=R0y; eng_az<=R0z; eng_ainf<=R0inf;
+            eng_op<=1'b0; eng_start<=1'b1;
+            state<=S_DBL_R0_W;
+        end
+ 
+        S_DBL_R0_W: if (eng_done) begin
+            Xd0_r<=eng_ox; Yd0_r<=eng_oy; Zd0_r<=eng_oz; Xd0_inf_r<=eng_oinf;
+            eng_ax<=R1x; eng_ay<=R1y; eng_az<=R1z; eng_ainf<=R1inf;
+            state<=S_LOAD_R1_DBL;
+        end
+ 
+        S_LOAD_R1_DBL: begin
+            eng_op<=1'b0; eng_start<=1'b1;
+            state<=S_DBL_R1_W;
+        end
+ 
+        S_DBL_R1_W: if (eng_done) begin
+            Xd1_r<=eng_ox; Yd1_r<=eng_oy; Zd1_r<=eng_oz; Xd1_inf_r<=eng_oinf;
+            state<=S_ADD_START;
+        end
+ 
+        S_ADD_START: begin
+            eng_ax<=R0x; eng_ay<=R0y; eng_az<=R0z; eng_ainf<=R0inf;
+            eng_bx<=R1x; eng_by<=R1y; eng_bz<=R1z; eng_binf<=R1inf;
+            eng_op<=1'b1; eng_start<=1'b1;
+            state<=S_LADD_W;
+        end
+ 
+        S_LADD_W: if (eng_done) begin
+            if (k[bit_idx]) begin
+                // R0 = R0 + R1 ; R1 = 2*R1
+                R0x<=eng_ox; R0y<=eng_oy; R0z<=eng_oz; R0inf<=eng_oinf;
+                R1x<=Xd1_r;  R1y<=Yd1_r;  R1z<=Zd1_r;  R1inf<=Xd1_inf_r;
+            end else begin
+                // R1 = R0 + R1 ; R0 = 2*R0
+                R1x<=eng_ox; R1y<=eng_oy; R1z<=eng_oz; R1inf<=eng_oinf;
+                R0x<=Xd0_r;  R0y<=Yd0_r;  R0z<=Zd0_r;  R0inf<=Xd0_inf_r;
+            end
+ 
+            if (bit_idx == 0) begin
+                state <= S_NORM0;
+            end else begin
+                bit_idx <= bit_idx - 1'b1;
+                state <= S_LADD;
+            end
+        end
+ 
+        //----------------------------------------------------
+        // Normalize R0 (Jacobian -> affine) using the ladder-idle
+        // engine's shared multiplier via the ext_* passthrough
+        //----------------------------------------------------
+        S_NORM0: if (R0inf || R0z == 0) begin
+            Rx<=0; Ry<=0; Rx_inf<=1'b1; state<=S_DONE;
+        end else begin
+            inv_start<=1'b1; state<=S_NORM1;
+        end
+ 
+        S_NORM1: if (inv_done) begin
+            ext_a<=Zinv; ext_b<=Zinv; ext_start<=1'b1;
+            state<=S_NORM1W;
+        end
+ 
+        S_NORM1W: if (ext_done) begin
+            Zinv2<=ext_res;
+            ext_a<=ext_res; ext_b<=Zinv; ext_start<=1'b1;
+            state<=S_NORM2;
+        end
+ 
+        S_NORM2: if (ext_done) begin
+            Zinv3<=ext_res;
+            ext_a<=R0x; ext_b<=Zinv2; ext_start<=1'b1;
+            state<=S_NORM2W;
+        end
+ 
+        S_NORM2W: if (ext_done) begin
+            Rx<=ext_res;
+            ext_a<=R0y; ext_b<=Zinv3; ext_start<=1'b1;
+            state<=S_NORM3;
+        end
+ 
+        S_NORM3: if (ext_done) begin
+            Ry<=ext_res; Rx_inf<=1'b0; state<=S_DONE;
+        end
+ 
+        S_CK1: if (ext_done) begin
+            ck_y2 <= ext_res;
+            ext_a <= Px; ext_b <= Px; ext_start <= 1'b1;      // x^2
+            state <= S_CK2;
+        end
+
+        S_CK2: if (ext_done) begin
+            ext_a <= ext_res; ext_b <= Px; ext_start <= 1'b1; // x^3
+            state <= S_CK3;
+        end
+
+        S_CK3: if (ext_done) begin
+            ck_x3 <= ext_res;
+            state <= S_CK4;
+        end
+
+        S_CK4: begin
+            chk_ok   <= ck_good;                              // y^2 == x^3+7 (mod p)
+            chk_done <= 1'b1;
+            state    <= S_IDLE;
+        end
+
+        S_DONE: begin
+            done<=1'b1;
+            if (start == 1'b0) state<=S_IDLE;
+        end
+ 
+        default: state<=S_IDLE;
+ 
+        endcase
+    end
+end
+ 
+endmodule
+`default_nettype wire
